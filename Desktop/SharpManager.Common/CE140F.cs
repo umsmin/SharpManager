@@ -24,6 +24,12 @@ namespace SharpManager
             Print
         }
 
+        private enum InputType
+        {
+            String,
+            Number
+        }
+
         /// <summary>The maximum number of open files</summary>
         private const int MaxFileHandles = 6;
 
@@ -69,6 +75,9 @@ namespace SharpManager
         /// <summary>The file handles</summary>
         private readonly FileStream?[] fileHandles = new FileStream[MaxFileHandles];
 
+        /// <summary>The look ahead value for each open file</summary>
+        private readonly int?[] fileLookAhead = new int?[MaxFileHandles];
+
         /// <summary>Gets the next command to process</summary>
         private NextCommand nextCommand = NextCommand.None;
 
@@ -95,6 +104,7 @@ namespace SharpManager
             {
                 fileHandles[i]?.Dispose();
                 fileHandles[i] = null;
+                fileLookAhead[i] = null;
             }
         }
 
@@ -143,11 +153,11 @@ namespace SharpManager
                 case 0x03: return CommandOpen(data);
                 case 0x04: return CommandClose(data);
                 case 0x0A: return CommandKill(data);
-                case 0x13: return CommandInput(data); // string         INPUT #x, X$
-                case 0x14: return CommandInput(data); // number         INPUT #x, X
+                case 0x13: return CommandInput(data, InputType.String, false);  // String         INPUT #x, X$
+                case 0x14: return CommandInput(data, InputType.Number, false);  // Number         INPUT #x, X
                 case 0x15: return CommandPrint(data);
-                // case 0x1F: return CommandInput(data); // ?? TODO
-                case 0x20: return CommandInput(data); // number array
+                case 0x1F: return CommandInput(data, InputType.String, true);   // String array   INPUT #x, X$(*)
+                case 0x20: return CommandInput(data, InputType.Number, true);   // Number array   INPUT #x, X(*)
 
                 /*
                 //case 0x08: process_INIT(0x08);break;
@@ -160,7 +170,7 @@ namespace SharpManager
                 */
                 default:
                     messageTarget.WriteLine($"Unknown disk command {data[0]:X2}");
-                    return new byte[] { 0xFF, 0 };
+                    return [0xFF, 0];
             }
         }
 
@@ -435,6 +445,7 @@ namespace SharpManager
                 {
                     fileHandles[i]?.Dispose();
                     fileHandles[i] = null;
+                    fileLookAhead[i] = null;
                 }
             }
             else
@@ -443,6 +454,8 @@ namespace SharpManager
                 int fileIndex = fileNumber - 2;        // Convert to index
                 fileHandles[fileIndex]?.Dispose();
                 fileHandles[fileIndex] = null;
+                fileLookAhead[fileIndex] = null;
+
             }
 
             return CreateResult(true);
@@ -479,6 +492,7 @@ namespace SharpManager
             {
                 fileHandles[fileIndex]?.Dispose();
                 fileHandles[fileIndex] = null;
+                fileLookAhead[fileIndex] = null;
             }
 
             fileName = Path.Combine(directoryInfo.FullName, fileName);
@@ -544,21 +558,10 @@ namespace SharpManager
             // No current file
             if (currentFile == null) return CreateResult(false);
 
-            // skip empty message (CRLF only)
-            if (data[0] == 0x0D && data[1] == 0x0A) return CreateResult(true);
-
             // Write data
             for (int i = 0; i < data.Length - 2; i++)  // Ignore 0 and checksum
             {
                 currentFile.WriteByte(data[i]);
-            }
-
-            // If no line terminater then add
-            if (data[^3] != 0x0A)
-            {
-                messageTarget.DebugWriteLine("  Appending CRLF");
-                currentFile.WriteByte(0x0D);
-                currentFile.WriteByte(0x0A);
             }
 
             return CreateResult(true);
@@ -569,11 +572,11 @@ namespace SharpManager
         /// </summary>
         /// <param name="data">The data.</param>
         /// <returns></returns>
-        private byte[] CommandInput(byte[] data)
+        private byte[] CommandInput(byte[] data, InputType type, bool isArray)
         {
             int fileNumber = data[1];
             int fileIndex = fileNumber - 2;
-            messageTarget.WriteLine($"INPUT #{fileNumber}");
+            messageTarget.WriteLine($"INPUT #{fileNumber} {type}");
             if (fileIndex < 0 || fileIndex > MaxFileHandles)
             {
                 messageTarget.WriteLine($"Invalid file #{fileNumber}");
@@ -590,14 +593,33 @@ namespace SharpManager
                 return CreateResult(false);
             }
 
+            // True if a numeric character was returned in the output
+            bool isNumber = false;
+
             // Read line from the file
             var result = new List<byte>();
+
             while (true)
             {
-                var value = fileHandles[fileIndex]?.ReadByte() ?? -1;
+                // Grab a value from the lookahead or the file directly
+                var value = fileLookAhead[fileIndex] ?? fileHandles[fileIndex]?.ReadByte() ?? -1;               
+                // If at the end of the file, return
                 if (value == -1) break;
-                result.Add((byte)value);    // Send byte
-                if (value == 0x0A) break;   // If LF then end line
+                // If the type is number and not loading an array, split numbers that exist in a line
+                if (type == InputType.Number && !isArray)
+                {
+                    // If a number exists, the value is not whitespace, and not already the lookahead, return the number
+                    if (isNumber && !IsNumericCharacter(value) && !fileLookAhead[fileIndex].HasValue)
+                    {
+                        if (!IsWhitespace(value) && value != ',') fileLookAhead[fileIndex] = value;
+                        break;
+                    }
+                    isNumber = isNumber || IsNumber(value);
+                }
+                 
+                fileLookAhead[fileIndex] = null;
+                if (isArray || !IsNewLineChar(value)) result.Add((byte)value);    // If not a newline char, send
+                if (value == 0x0A && !isArray) break;                  // If LF then end line
             }
             result.Add(0);                  // Add an additional zero byte
             result.AddFrame();              // Frame the line
@@ -669,5 +691,13 @@ namespace SharpManager
         {
             return CreateArray(success ? (byte)0 : (byte)0xFF);
         }
+
+        private static bool IsNumericCharacter(int value) => value == '-' || value == '.' || IsNumber(value);
+
+        private static bool IsWhitespace(int value) => value == ' ' || value == 0x0D || value == 0x0A || value == 0x09;
+
+        private static bool IsNumber(int value) => (value >= '0' && value <= '9');
+
+        private static bool IsNewLineChar(int value) => value == 0x0D || value == 0x0A;
     }
 }
