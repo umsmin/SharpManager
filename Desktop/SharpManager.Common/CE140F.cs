@@ -30,6 +30,38 @@ namespace SharpManager
             Number
         }
 
+        private enum RecordFormat
+        {
+            Ascii,
+            Binary
+        }
+
+        private sealed class FileHandle : IDisposable
+        {
+            public FileHandle(FileStream stream, RecordFormat recordFormat = RecordFormat.Ascii)
+            {
+                Stream = stream;
+                RecordFormat = recordFormat;
+            }
+
+            public FileStream Stream { get; }
+
+            public RecordFormat RecordFormat { get; }
+
+            public int? LookAhead { get; set; }
+
+            public int Size { get; set; }
+
+            public int ReadByte()
+            {
+                var value = LookAhead ?? Stream.ReadByte();
+                LookAhead = null;
+                return value;
+            }
+
+            public void Dispose() => Stream.Dispose();
+        }
+
         /// <summary>The maximum number of open files</summary>
         private const int MaxFileHandles = 6;
 
@@ -64,19 +96,13 @@ namespace SharpManager
         private readonly IDebugTarget messageTarget;
 
         /// <summary>The currently open file</summary>
-        private FileStream? currentFile = null;
+        private FileHandle? currentFile = null;
 
         /// <summary>The error frame</summary>
         private readonly byte[] ErrorFrame = new byte[] { 0xFF, 0 };
 
-        /// <summary>The current file size</summary>
-        private int currentFileSize = 0;
-
         /// <summary>The file handles</summary>
-        private readonly FileStream?[] fileHandles = new FileStream[MaxFileHandles];
-
-        /// <summary>The look ahead value for each open file</summary>
-        private readonly int?[] fileLookAhead = new int?[MaxFileHandles];
+        private readonly FileHandle?[] fileHandles = new FileHandle[MaxFileHandles];
 
         /// <summary>Gets the next command to process</summary>
         private NextCommand nextCommand = NextCommand.None;
@@ -99,12 +125,10 @@ namespace SharpManager
             fileIndex = 0;
             currentFile?.Dispose();
             currentFile = null;
-            currentFileSize = 0;
             for (int i = 0; i < MaxFileHandles; i++)
             {
                 fileHandles[i]?.Dispose();
                 fileHandles[i] = null;
-                fileLookAhead[i] = null;
             }
         }
 
@@ -252,8 +276,8 @@ namespace SharpManager
             // Get filename
             string filePath = Path.Combine(directoryInfo.FullName, fileName);
             messageTarget.DebugWriteLine($"  {filePath}");
-            currentFile = File.OpenRead(filePath);
-            result.AddSize((int)currentFile.Length);
+            currentFile = new FileHandle(File.OpenRead(filePath));
+            result.AddSize((int)currentFile.Stream.Length);
             return result.ToFrame();
         }
 
@@ -281,7 +305,6 @@ namespace SharpManager
             while (true)
             {
                 var value = currentFile?.ReadByte() ?? -1;
-                if (value == 0x0A) continue;            // Ignore line-feeds
                 if (value == -1)
                 {
                     result.Add(0x1A);           // Send EOF
@@ -289,8 +312,18 @@ namespace SharpManager
                     currentFile = null;
                     break;                  // End
                 }
+                if (IsNewLineChar(value))
+                {
+                    // Consume an optional LF after CR, preserving any other byte for the next read.
+                    if (value == Ascii.CR && currentFile != null)
+                    {
+                        var nextValue = currentFile.ReadByte();
+                        if (nextValue != -1 && nextValue != Ascii.LF) currentFile.LookAhead = nextValue;
+                    }
+                    result.Add(Ascii.CR);
+                    break;
+                }
                 result.Add((byte)value);    // Send byte
-                if (value == 0x0D) break;   // If CR then end line
             }
             result.AddFrame();              // Frame the line
             result.Add(0);                  // Add an additional zero byte
@@ -309,7 +342,7 @@ namespace SharpManager
             var buffer = new byte[256];
             while (true)
             {
-                int bytesRead = currentFile?.Read(buffer, 0, buffer.Length) ?? 0;
+                int bytesRead = currentFile?.Stream.Read(buffer, 0, buffer.Length) ?? 0;
                 if (bytesRead == 0) break;
                 result.AddBlock(new ArraySegment<byte>(buffer, 0, bytesRead));
             }
@@ -338,7 +371,7 @@ namespace SharpManager
             // Get filename
             string filePath = Path.Combine(directoryInfo.FullName, fileName);
             messageTarget.DebugWriteLine($"  {filePath}");
-            currentFile = File.OpenWrite(filePath);
+            currentFile = new FileHandle(File.OpenWrite(filePath));
             return CreateResult(true);
         }
 
@@ -349,8 +382,10 @@ namespace SharpManager
         /// <returns></returns>
         private byte[] CommandSaveBinary(byte[] data)
         {
-            currentFileSize = data[2] + (data[3] << 8) + (data[4] << 16);
-            messageTarget.DebugWriteLine($"Save binary file (size {currentFileSize:n0})");
+            if (currentFile == null) return CreateResult(false);
+
+            currentFile.Size = data[2] + (data[3] << 8) + (data[4] << 16);
+            messageTarget.DebugWriteLine($"Save binary file (size {currentFile.Size:n0})");
             nextCommand = NextCommand.BinarySave;
             return CreateResult(true);
         }
@@ -391,7 +426,7 @@ namespace SharpManager
             // Last byte is checksum so ignore
             for (int i = 0; i < data.Length - 1; i++)
             {
-                currentFile.WriteByte(data[i]);
+                currentFile.Stream.WriteByte(data[i]);
             }
 
             return CreateResult(true);
@@ -411,11 +446,11 @@ namespace SharpManager
             for (int i = 0; i < data.Length - 1; i++)
             {
                 // messageTarget.Write("."); TODO remove
-                currentFile.WriteByte(data[i]);
+                currentFile.Stream.WriteByte(data[i]);
             }
 
             // If the file is the correct size, close the file
-            if (currentFile.Length == currentFileSize)
+            if (currentFile.Stream.Length == currentFile.Size)
             {
                 messageTarget.WriteLine("Done.");
                 currentFile.Dispose();
@@ -445,16 +480,20 @@ namespace SharpManager
                 {
                     fileHandles[i]?.Dispose();
                     fileHandles[i] = null;
-                    fileLookAhead[i] = null;
                 }
             }
             else
             {
                 messageTarget.WriteLine($"CLOSE #{fileNumber:X2}");
                 int fileIndex = fileNumber - 2;        // Convert to index
+                if (!IsValidFileIndex(fileIndex))
+                {
+                    messageTarget.WriteLine($"Invalid file #{fileNumber}");
+                    return CreateResult(false);
+                }
+
                 fileHandles[fileIndex]?.Dispose();
                 fileHandles[fileIndex] = null;
-                fileLookAhead[fileIndex] = null;
 
             }
 
@@ -482,7 +521,7 @@ namespace SharpManager
             string fileModeText = fileMode == 1 ? "INPUT" : (fileMode == 2 ? "OUTPUT" : "APPEND");
 
             messageTarget.WriteLine($"OPEN \"{fileName}\" FOR {fileModeText} AS #{fileNumber}");
-            if (fileIndex < 0 || fileIndex > MaxFileHandles)
+            if (!IsValidFileIndex(fileIndex))
             {
                 messageTarget.WriteLine($"Invalid file #{fileNumber}");
                 return CreateResult(false);
@@ -492,16 +531,16 @@ namespace SharpManager
             {
                 fileHandles[fileIndex]?.Dispose();
                 fileHandles[fileIndex] = null;
-                fileLookAhead[fileIndex] = null;
             }
 
+            var recordFormat = GetRecordFormat(fileName);
             fileName = Path.Combine(directoryInfo.FullName, fileName);
 
             try
             {
-                if (fileMode == 1) fileHandles[fileIndex] = new FileStream(fileName, FileMode.Open, FileAccess.Read);
-                else if (fileMode == 2) fileHandles[fileIndex] = new FileStream(fileName, FileMode.Create, FileAccess.Write);
-                else if (fileMode == 3) fileHandles[fileIndex] = new FileStream(fileName, FileMode.Append, FileAccess.Write);
+                if (fileMode == 1) fileHandles[fileIndex] = new FileHandle(new FileStream(fileName, FileMode.Open, FileAccess.Read), recordFormat);
+                else if (fileMode == 2) fileHandles[fileIndex] = new FileHandle(new FileStream(fileName, FileMode.Create, FileAccess.Write), recordFormat);
+                else if (fileMode == 3) fileHandles[fileIndex] = new FileHandle(new FileStream(fileName, FileMode.Append, FileAccess.Write), recordFormat);
                 else
                 {
                     messageTarget.WriteLine($"Invalid file mode {fileMode}");
@@ -527,24 +566,25 @@ namespace SharpManager
             int fileNumber = data[1];
             int fileIndex = fileNumber - 2;
             messageTarget.WriteLine($"PRINT #{fileNumber}");
-            if (fileIndex < 0 || fileIndex > MaxFileHandles)
+            if (!IsValidFileIndex(fileIndex))
             {
                 messageTarget.WriteLine($"Invalid file #{fileNumber}");
                 return CreateResult(false);
             }
-            if (fileHandles[fileIndex] == null)
+            var file = fileHandles[fileIndex];
+            if (file == null)
             {
                 messageTarget.WriteLine($"File #{fileNumber} not open");
                 return CreateResult(false);
             }
-            if (!fileHandles[fileIndex]?.CanWrite ?? false)
+            if (!file.Stream.CanWrite)
             {
                 messageTarget.WriteLine($"File #{fileNumber} not writable");
                 return CreateResult(false);
             }
 
             nextCommand = NextCommand.Print;
-            currentFile = fileHandles[fileIndex];
+            currentFile = file;
             return CreateResult(true);
         }
 
@@ -558,11 +598,8 @@ namespace SharpManager
             // No current file
             if (currentFile == null) return CreateResult(false);
 
-            // Write data
-            for (int i = 0; i < data.Length - 2; i++)  // Ignore 0 and checksum
-            {
-                currentFile.WriteByte(data[i]);
-            }
+            if (currentFile.RecordFormat == RecordFormat.Binary) WriteBinaryRecord(currentFile.Stream, data);
+            else WriteAsciiRecord(currentFile.Stream, data);
 
             return CreateResult(true);
         }
@@ -577,22 +614,71 @@ namespace SharpManager
             int fileNumber = data[1];
             int fileIndex = fileNumber - 2;
             messageTarget.WriteLine($"INPUT #{fileNumber} {type}");
-            if (fileIndex < 0 || fileIndex > MaxFileHandles)
+            if (!IsValidFileIndex(fileIndex))
             {
                 messageTarget.WriteLine($"Invalid file #{fileNumber}");
                 return CreateResult(false);
             }
-            if (fileHandles[fileIndex] == null)
+            var file = fileHandles[fileIndex];
+            if (file == null)
             {
                 messageTarget.WriteLine($"File #{fileNumber} not open");
                 return CreateResult(false);
             }
-            if (!fileHandles[fileIndex]?.CanRead ?? false)
+            if (!file.Stream.CanRead)
             {
                 messageTarget.WriteLine($"File #{fileNumber} not readable");
                 return CreateResult(false);
             }
 
+            if (file.RecordFormat == RecordFormat.Binary) return ReadBinaryInput(file.Stream, type, isArray);
+            return ReadAsciiInput(file, type, isArray);
+        }
+
+        /// <summary>
+        /// Write an ASCII record to the file.
+        /// </summary>
+        /// <param name="file">The file.</param>
+        /// <param name="data">The data.</param>
+        private static void WriteAsciiRecord(FileStream file, byte[] data)
+        {
+            // Write data
+            for (int i = 0; i < data.Length - 2; i++)  // Ignore 0 and checksum
+            {
+                file.WriteByte(data[i]);
+            }
+        }
+
+        /// <summary>
+        /// Write a null-terminated record to the file.
+        /// </summary>
+        /// <param name="file">The file.</param>
+        /// <param name="data">The data.</param>
+        private static void WriteBinaryRecord(FileStream file, byte[] data)
+        {
+            int recordLength = Math.Max(0, data.Length - 2);  // Ignore 0 and checksum
+            if (recordLength >= 2 && data[recordLength - 2] == Ascii.CR && data[recordLength - 1] == Ascii.LF)
+            {
+                recordLength -= 2;
+            }
+
+            for (int i = 0; i < recordLength; i++)
+            {
+                file.WriteByte(data[i]);
+            }
+
+            file.WriteByte(Ascii.NUL);
+        }
+
+        /// <summary>
+        /// Read an ASCII record from the file.
+        /// </summary>
+        /// <param name="file">The file.</param>
+        /// <param name="type">The input type.</param>
+        /// <param name="isArray">if set to <c>true</c> then array.</param>
+        /// <returns></returns>
+        private static byte[] ReadAsciiInput(FileHandle file, InputType type, bool isArray)
+        {
             // True if a numeric character was returned in the output
             bool isNumber = false;
 
@@ -602,22 +688,22 @@ namespace SharpManager
             while (true)
             {
                 // Grab a value from the lookahead or the file directly
-                var value = fileLookAhead[fileIndex] ?? fileHandles[fileIndex]?.ReadByte() ?? -1;               
+                var value = file.LookAhead ?? file.Stream.ReadByte();               
                 // If at the end of the file, return
                 if (value == -1) break;
                 // If the type is number and not loading an array, split numbers that exist in a line
                 if (type == InputType.Number && !isArray)
                 {
                     // If a number exists, the value is not whitespace, and not already the lookahead, return the number
-                    if (isNumber && !IsNumericCharacter(value) && !fileLookAhead[fileIndex].HasValue)
+                    if (isNumber && !IsNumericCharacter(value) && !file.LookAhead.HasValue)
                     {
-                        if (!IsWhitespace(value) && value != ',') fileLookAhead[fileIndex] = value;
+                        if (!IsWhitespace(value) && value != ',') file.LookAhead = value;
                         break;
                     }
                     isNumber = isNumber || IsNumber(value);
                 }
                  
-                fileLookAhead[fileIndex] = null;
+                file.LookAhead = null;
                 if (isArray || !IsNewLineChar(value)) result.Add((byte)value);    // If not a newline char, send
                 if (value == 0x0A && !isArray) break;                  // If LF then end line
             }
@@ -625,6 +711,52 @@ namespace SharpManager
             result.AddFrame();              // Frame the line
             result.Add(0);                  // Add an additional zero byte
             return result.ToArray();
+        }
+
+        /// <summary>
+        /// Read a null-terminated record from the file.
+        /// </summary>
+        /// <param name="file">The file.</param>
+        /// <param name="type">The input type.</param>
+        /// <param name="isArray">if set to <c>true</c> then array.</param>
+        /// <returns></returns>
+        private static byte[] ReadBinaryInput(FileStream file, InputType type, bool isArray)
+        {
+            var record = new List<byte>();
+            while (true)
+            {
+                var value = file.ReadByte();
+                if (value == -1 || value == Ascii.NUL) break;
+                record.Add((byte)value);
+            }
+
+            var result = type == InputType.Number && !isArray ? ReadFirstNumber(record) : record;
+            result.Add(0);                  // Add an additional zero byte
+            result.AddFrame();              // Frame the line
+            result.Add(0);                  // Add an additional zero byte
+            return result.ToArray();
+        }
+
+        /// <summary>
+        /// Read the first complete number in a record.
+        /// </summary>
+        /// <param name="record">The record.</param>
+        /// <returns></returns>
+        private static List<byte> ReadFirstNumber(IEnumerable<byte> record)
+        {
+            var result = new List<byte>();
+            bool hasStarted = false;
+
+            foreach (var value in record)
+            {
+                if (!hasStarted && !IsNumericCharacter(value)) continue;
+                if (hasStarted && !IsNumericCharacter(value)) break;
+
+                result.Add(value);
+                hasStarted = true;
+            }
+
+            return result;
         }
 
         /// <summary>
@@ -661,6 +793,27 @@ namespace SharpManager
         }
 
         /// <summary>
+        /// Gets the record format for a file.
+        /// </summary>
+        /// <param name="fileName">Name of the file.</param>
+        /// <returns></returns>
+        private static RecordFormat GetRecordFormat(string fileName)
+        {
+            var extension = Path.GetExtension(fileName).TrimStart('.');
+            return extension.Equals("DAT", StringComparison.OrdinalIgnoreCase) ||
+                   extension.Equals("BIN", StringComparison.OrdinalIgnoreCase)
+                ? RecordFormat.Binary
+                : RecordFormat.Ascii;
+        }
+
+        /// <summary>
+        /// Determines whether the file index is valid.
+        /// </summary>
+        /// <param name="fileIndex">Index of the file.</param>
+        /// <returns></returns>
+        private static bool IsValidFileIndex(int fileIndex) => fileIndex >= 0 && fileIndex < MaxFileHandles;
+
+        /// <summary>
         /// Creates the frame.
         /// </summary>
         /// <param name="data">The data.</param>
@@ -677,20 +830,14 @@ namespace SharpManager
         /// </summary>
         /// <param name="data">The data.</param>
         /// <returns></returns>
-        private static byte[] CreateArray(params byte[] data)
-        {
-            return data;
-        }
+        private static byte[] CreateArray(params byte[] data) => data;
 
         /// <summary>
         /// Creates the result.
         /// </summary>
         /// <param name="success">if set to <c>true</c> [success].</param>
         /// <returns></returns>
-        private static byte[] CreateResult(bool success)
-        {
-            return CreateArray(success ? (byte)0 : (byte)0xFF);
-        }
+        private static byte[] CreateResult(bool success) => CreateArray(success ? (byte)0 : (byte)0xFF);
 
         private static bool IsNumericCharacter(int value) => value == '-' || value == '.' || IsNumber(value);
 
